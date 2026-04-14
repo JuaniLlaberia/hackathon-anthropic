@@ -1,28 +1,56 @@
+import logging
 from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from .models import Publication, PublicationStatus, Category, Media
+from app.config import get_settings
+from .models import Publication, PublicationStatus, Category, Media, AgentSession
+from .agent_service import AgentService
 
-PUBLICATION_STEPS = [
-    {"step": 0, "field": "category", "prompt": "Que queres publicar?\n1. Venta\n2. Servicio\n3. Evento\n4. Otro"},
-    {"step": 1, "field": "title", "prompt": "Dale un titulo a tu publicacion:"},
-    {"step": 2, "field": "body", "prompt": "Escribi la descripcion:"},
-    {"step": 3, "field": "media", "prompt": "Envia una foto (o escribi 'omitir'):"},
-    {"step": 4, "field": "confirm", "prompt": "Tu publicacion:\n\n*{title}*\n{body}\n\nConfirmar? (si/no)"},
-]
+logger = logging.getLogger(__name__)
+
+settings = get_settings()
 
 
 class PublicationService:
     def __init__(self, db: Session):
         self.db = db
 
-    async def process_message(self, user_id: UUID, message: str) -> dict:
-        if message.lower() in ["publicar", "nueva", "crear"]:
-            return {"response": PUBLICATION_STEPS[0]["prompt"]}
+    async def process_message(self, user_id: UUID, message: str, image_url: str | None = None) -> dict:
+        # If no Anthropic key configured, fallback to simple response
+        if not settings.ANTHROPIC_API_KEY:
+            return {"response": "El agente de publicacion no esta configurado. Falta ANTHROPIC_API_KEY."}
 
-        # TODO: implementar flujo paso a paso con session (similar a onboarding)
-        return {"response": "Escribi 'publicar' para crear una nueva publicacion."}
+        # Find active agent session for this user
+        agent_session = (
+            self.db.query(AgentSession)
+            .filter(AgentSession.user_id == user_id, AgentSession.completed == False)
+            .order_by(AgentSession.created_at.desc())
+            .first()
+        )
+
+        agent = AgentService(self.db)
+        result = await agent.process_message(
+            user_id=user_id,
+            session_id=agent_session.session_id if agent_session else None,
+            message=message,
+            image_url=image_url,
+        )
+
+        # Persist session if new
+        if not agent_session:
+            agent_session = AgentSession(
+                user_id=user_id,
+                session_id=result["session_id"],
+            )
+            self.db.add(agent_session)
+
+        if result.get("completed"):
+            agent_session.completed = True
+
+        self.db.commit()
+
+        return {"response": result["response"]}
 
     async def create_publication(self, user_id: UUID, data: dict) -> Publication:
         pub = Publication(

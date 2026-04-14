@@ -49,25 +49,31 @@ def _verify_signature(payload: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def _extract_phone_and_text(data: dict) -> tuple[str, str] | None:
-    """Extrae phone y texto de un evento whatsapp.message.received de Kapso."""
+def _extract_message(data: dict) -> dict | None:
+    """
+    Extrae phone, texto e imagen de un evento whatsapp.message.received de Kapso.
+    Retorna: {"phone": str, "text": str, "image_url": str | None} o None.
+    """
     msg = data.get("message", {})
 
-    # Payload real de Kapso: phone viene en message.from, no en contact
     phone = msg.get("from") or data.get("conversation", {}).get("phone_number")
     if not phone:
         return None
 
     msg_type = msg.get("type", "")
+
     if msg_type == "text":
-        text = msg.get("text", {}).get("body", "")
+        return {"phone": phone, "text": msg.get("text", {}).get("body", ""), "image_url": None}
     elif msg_type == "button":
-        text = msg.get("button", {}).get("text", "")
+        return {"phone": phone, "text": msg.get("button", {}).get("text", ""), "image_url": None}
+    elif msg_type == "image":
+        image = msg.get("image", {})
+        caption = image.get("caption", "")
+        image_url = image.get("link") or image.get("url") or msg.get("kapso", {}).get("media_url")
+        return {"phone": phone, "text": caption, "image_url": image_url}
     else:
         logger.info(f"Mensaje tipo '{msg_type}' de {phone} - no procesado")
         return None
-
-    return phone, text
 
 
 @router.post("")
@@ -98,42 +104,39 @@ async def receive_webhook(
 
     for event_data in events:
         event_type = x_webhook_event or event_data.get("event")
-        logger.info(f"Evento: {event_type} | idempotency_key={x_idempotency_key}")
+        print(f"[WEBHOOK] Evento: {event_type}", flush=True)
 
         if event_type != "whatsapp.message.received":
             continue
 
-        extracted = _extract_phone_and_text(event_data)
+        extracted = _extract_message(event_data)
         if not extracted:
+            print(f"[WEBHOOK] No se pudo extraer mensaje", flush=True)
             continue
 
-        phone, text = extracted
-        logger.info(f"Mensaje de {phone}: {text!r}")
+        phone = extracted["phone"]
+        text = extracted["text"]
+        image_url = extracted["image_url"]
+        print(f"[WEBHOOK] Mensaje de {phone}: {text!r} image={image_url}", flush=True)
 
         # Reset command — always handled by onboarding, regardless of user state
         if text.strip().lower() in {"reiniciar", "reset", "/reiniciar", "/reset"}:
             service = OnboardingService(db)
             response = await service.process_step(phone, text)
         else:
-            # Dispatcher decide: onboarding o publication
-            result = await dispatch_message(phone, text, db)
-
-            if result["module"] == "onboarding":
-                service = OnboardingService(db)
-                response = await service.process_step(phone, text)
-            else:
-                service = PublicationService(db)
-                response = await service.process_message(result["user"].id, text)
+            service = PublicationService(db)
+            response = await service.process_message(result["user"].id, text, image_url=image_url)
 
         # Enviar respuesta al usuario via WhatsApp
         response_text = response.get("response", "")
+        print(f"[WEBHOOK] Response to send: {response_text[:200]!r}", flush=True)
         if response_text and settings.KAPSO_API_KEY and settings.KAPSO_PHONE_NUMBER_ID:
             try:
                 kapso = _get_kapso_client()
                 kapso.send_text(to=phone, body=response_text)
-                logger.info(f"Respuesta enviada a {phone}")
+                print(f"[WEBHOOK] Sent to {phone}", flush=True)
             except KapsoError as e:
-                logger.error(f"Error enviando respuesta a {phone}: {e}")
+                print(f"[WEBHOOK] Kapso send error: {e}", flush=True)
 
     # Kapso requiere 200 OK en menos de 10 segundos
     return {"status": "ok"}
