@@ -52,17 +52,18 @@ def _verify_signature(payload: bytes, signature: str) -> bool:
 def _extract_phone_and_text(data: dict) -> tuple[str, str] | None:
     """Extrae phone y texto de un evento whatsapp.message.received de Kapso."""
     msg = data.get("message", {})
-    contact = data.get("contact", {})
 
-    phone = contact.get("phone_number") or contact.get("wa_id")
+    # Payload real de Kapso: phone viene en message.from, no en contact
+    phone = msg.get("from") or data.get("conversation", {}).get("phone_number")
     if not phone:
         return None
 
     msg_type = msg.get("type", "")
     if msg_type == "text":
         text = msg.get("text", {}).get("body", "")
+    elif msg_type == "button":
+        text = msg.get("button", {}).get("text", "")
     else:
-        # Para otros tipos (imagen, etc) por ahora ignoramos
         logger.info(f"Mensaje tipo '{msg_type}' de {phone} - no procesado")
         return None
 
