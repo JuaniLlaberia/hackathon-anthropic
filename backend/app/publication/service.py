@@ -17,7 +17,7 @@ class PublicationService:
     def __init__(self, db: Session):
         self.db = db
 
-    async def process_message(self, user_id: UUID, message: str) -> dict:
+    async def process_message(self, user_id: UUID, message: str, image_url: str | None = None) -> dict:
         if message.lower() in ["publicar", "nueva", "crear"]:
             return {"response": PUBLICATION_STEPS[0]["prompt"]}
 

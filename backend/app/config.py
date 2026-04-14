@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     KAPSO_API_KEY: str = ""
     KAPSO_PHONE_NUMBER_ID: str = ""
 
+    # Anthropic
+    ANTHROPIC_API_KEY: str = ""
+
     # Cloudinary
     CLOUDINARY_CLOUD_NAME: str = ""
     CLOUDINARY_API_KEY: str = ""
