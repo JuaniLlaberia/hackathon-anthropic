@@ -1,9 +1,11 @@
 import logging
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.shared.models.user import User
 from .models import Publication, PublicationStatus, Category, Media, AgentSession
 from .agent_service import AgentService
 
@@ -11,50 +13,73 @@ logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
+SESSION_TTL_MINUTES = 60
+
 
 class PublicationService:
     def __init__(self, db: Session):
         self.db = db
 
-    async def process_message(self, user_id: UUID, message: str, image_url: str | None = None) -> dict:
-        # If no Anthropic key configured, fallback to simple response
-        if not settings.ANTHROPIC_API_KEY:
-            return {"response": "El agente de publicacion no esta configurado. Falta ANTHROPIC_API_KEY."}
-
-        # Find active agent session for this user
-        agent_session = (
+    def _get_or_create_session(self, user_id: UUID) -> AgentSession:
+        """Find an active agent session or create a new one."""
+        session = (
             self.db.query(AgentSession)
             .filter(AgentSession.user_id == user_id, AgentSession.completed == False)
             .order_by(AgentSession.created_at.desc())
             .first()
         )
 
-        # Use stored image_url from previous messages if current message has none
-        effective_image_url = image_url or (agent_session.image_url if agent_session else None)
+        # Auto-expire stale sessions
+        if session and session.created_at:
+            age = datetime.utcnow() - session.created_at
+            if age > timedelta(minutes=SESSION_TTL_MINUTES):
+                print(f"[PUB] Session expired for user {user_id} (age: {age})", flush=True)
+                session.completed = True
+                self.db.commit()
+                session = None
 
-        agent = AgentService(self.db)
+        if not session:
+            session = AgentSession(
+                user_id=user_id,
+                session_id="local",  # legacy column
+                data={"messages": []},
+            )
+            self.db.add(session)
+            self.db.commit()
+            self.db.refresh(session)
+
+        return session
+
+    async def process_message(self, user_id: UUID, message: str, image_url: str | None = None) -> dict:
+        if not settings.ANTHROPIC_API_KEY:
+            return {"response": "El agente de publicacion no esta configurado. Falta ANTHROPIC_API_KEY."}
+
+        # Get user's ML access token for authenticated ML API calls
+        user = self.db.query(User).filter(User.id == user_id).first()
+        access_token = user.ml_access_token if user else None
+
+        # Find or create agent session with conversation history
+        agent_session = self._get_or_create_session(user_id)
+        data = agent_session.data or {}
+        history = data.get("messages", [])
+
+        # Store image_url from first photo — reuse across messages
+        if image_url:
+            data["image_url"] = image_url
+        stored_image_url = data.get("image_url")
+
+        agent = AgentService()
         result = await agent.process_message(
-            user_id=user_id,
-            session_id=agent_session.session_id if agent_session else None,
             message=message,
-            image_url=effective_image_url,
+            image_url=stored_image_url,
+            access_token=access_token,
+            history=history,
         )
 
-        # Persist session if new
-        if not agent_session:
-            agent_session = AgentSession(
-                user_id=user_id,
-                session_id=result["session_id"],
-            )
-            self.db.add(agent_session)
-
-        # Save image_url if this message had one
-        if image_url:
-            agent_session.image_url = image_url
-
+        # Persist updated conversation history + image_url
+        agent_session.data = {"messages": result["messages"], "image_url": stored_image_url}
         if result.get("completed"):
             agent_session.completed = True
-
         self.db.commit()
 
         return {"response": result["response"]}

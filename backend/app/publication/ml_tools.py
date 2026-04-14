@@ -1,6 +1,8 @@
 """
-Custom tools para que el agente de Claude interactue con la API de Mercado Libre.
-Estas funciones se ejecutan cuando el agente llama a un custom tool.
+Funciones para interactuar con la API de Mercado Libre.
+
+publish_listing() es la unica funcion expuesta al agente.
+Internamente: busca categoria → resuelve atributos → sube imagen → crea listing.
 """
 
 from __future__ import annotations
@@ -14,158 +16,231 @@ ML_BASE_URL = "https://api.mercadolibre.com"
 ML_SITE = "MLA"  # Argentina
 
 
-async def search_ml_category(query: str) -> dict:
-    """
-    Predice la categoria de Mercado Libre para un producto.
-    Usa el domain_discovery endpoint de ML.
-    """
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
+# ── Public: price estimate (exposed to agent) ──
+
+
+async def get_price_estimate(query: str) -> dict:
+    """Search ML for similar products and return a price range."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{ML_BASE_URL}/sites/{ML_SITE}/search",
+            params={"q": query, "limit": 10},
+        )
+    if resp.is_error:
+        return {"error": "No pude buscar precios de referencia, pedile al usuario que sugiera un precio."}
+
+    results = resp.json().get("results", [])
+    prices = [r["price"] for r in results if r.get("price")]
+    if not prices:
+        return {"error": "No encontré productos similares para estimar precio."}
+
+    return {
+        "min": min(prices),
+        "max": max(prices),
+        "avg": round(sum(prices) / len(prices)),
+        "count": len(prices),
+        "suggestion": f"Productos similares se venden entre ${min(prices):,.0f} y ${max(prices):,.0f} (promedio ${round(sum(prices) / len(prices)):,.0f})",
+    }
+
+
+# ── Internal helpers (NOT exposed to the agent) ──
+
+
+async def _search_category(query: str) -> str | None:
+    """Return the best category_id for a product query, or None."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
             f"{ML_BASE_URL}/sites/{ML_SITE}/domain_discovery/search",
             params={"q": query},
         )
-    if response.is_error:
-        return {"error": f"ML API error: {response.status_code}"}
-
-    results = response.json()
-    if not results:
-        return {"error": "No se encontraron categorias para ese producto"}
-
-    # Devolver las primeras 3 sugerencias
-    categories = []
-    for r in results[:3]:
-        categories.append({
-            "category_id": r.get("category_id"),
-            "category_name": r.get("category_name"),
-            "domain_name": r.get("domain_name"),
-        })
-    return {"categories": categories}
+    if resp.is_error or not resp.json():
+        return None
+    return resp.json()[0].get("category_id")
 
 
-async def get_category_attributes(category_id: str) -> dict:
-    """
-    Obtiene los atributos requeridos para una categoria de ML.
-    """
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"{ML_BASE_URL}/categories/{category_id}/attributes"
-        )
-    if response.is_error:
-        return {"error": f"ML API error: {response.status_code}"}
-
-    attributes = response.json()
-
-    # Filtrar solo los requeridos y relevantes
+async def _get_required_attribute_ids(category_id: str) -> list[str]:
+    """Return list of required attribute IDs for a category."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"{ML_BASE_URL}/categories/{category_id}/attributes")
+    if resp.is_error:
+        return ["BRAND", "MODEL"]  # safe fallback
+    attrs = resp.json()
     required = []
-    optional = []
-    for attr in attributes:
+    for attr in attrs:
         tags = attr.get("tags", {})
-        info = {
-            "id": attr["id"],
-            "name": attr["name"],
-            "type": attr.get("value_type", "string"),
-        }
-        # Incluir valores permitidos si existen
-        values = attr.get("values", [])
-        if values and len(values) <= 20:
-            info["allowed_values"] = [
-                {"id": v["id"], "name": v["name"]} for v in values
-            ]
-
         if tags.get("required") or tags.get("catalog_required"):
-            required.append(info)
-        elif attr.get("relevance", 0) >= 1:
-            optional.append(info)
-
-    return {"required_attributes": required, "optional_attributes": optional[:10]}
+            required.append(attr["id"])
+    return required if required else ["BRAND", "MODEL"]
 
 
-async def create_ml_listing(
+async def _find_gtin(brand: str, model: str) -> str | None:
+    """Search UPC Item DB for the product's GTIN/EAN barcode."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://api.upcitemdb.com/prod/trial/search",
+                params={"s": f"{brand} {model}", "type": "product"},
+                headers={"Accept": "application/json"},
+            )
+        if resp.is_error:
+            print(f"[GTIN] UPC DB error: {resp.status_code}", flush=True)
+            return None
+
+        items = resp.json().get("items", [])
+        if not items:
+            print(f"[GTIN] No results for {brand} {model}", flush=True)
+            return None
+
+        # Return the first EAN/UPC found
+        ean = items[0].get("ean") or items[0].get("upc")
+        print(f"[GTIN] Found: {ean} for {brand} {model}", flush=True)
+        return ean
+    except Exception as e:
+        print(f"[GTIN] Error: {e}", flush=True)
+        return None
+
+
+async def _upload_image(access_token: str, image_url: str) -> str | None:
+    """Download image from URL and upload to ML. Returns picture_id or None."""
+    # Download (Kapso URLs are temporary redirects)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+        dl = await client.get(image_url)
+    if dl.is_error:
+        logger.warning(f"Failed to download image: {dl.status_code}")
+        return None
+
+    content_type = dl.headers.get("content-type", "image/jpeg")
+    ext = "jpg" if "jpeg" in content_type or "jpg" in content_type else "png"
+
+    # Upload as multipart to ML
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{ML_BASE_URL}/pictures/items/upload",
+            headers={"Authorization": f"Bearer {access_token}"},
+            files={"file": (f"image.{ext}", dl.content, content_type)},
+        )
+    if resp.is_error:
+        logger.warning(f"Failed to upload image to ML: {resp.status_code}")
+        return None
+
+    return resp.json().get("id")
+
+
+# ── Public function (exposed to the agent as a tool) ──
+
+
+async def publish_listing(
     access_token: str,
+    image_url: str | None,
+    brand: str,
+    model: str,
     title: str,
-    category_id: str,
     price: float,
     condition: str,
     description: str,
-    currency_id: str = "ARS",
-    available_quantity: int = 1,
-    buying_mode: str = "buy_it_now",
-    listing_type_id: str = "free",
-    attributes: list | None = None,
-    picture_url: str | None = None,
 ) -> dict:
     """
-    Crea una publicacion en Mercado Libre.
-    Primero crea el item, luego agrega la descripcion (endpoint separado).
+    Full publication pipeline:
+    1. Search ML category from title
+    2. Get required attributes and build them
+    3. Upload image if available
+    4. Create listing with correct payload
     """
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
+    print(f"[PUBLISH] Starting: {title} | {brand} {model} | ${price}", flush=True)
 
-    # Build item payload
-    item_payload = {
-        "title": title[:60],
+    # 1. Find category
+    category_id = await _search_category(f"{brand} {model}")
+    if not category_id:
+        category_id = await _search_category(title)
+    if not category_id:
+        return {"error": "No se encontró una categoría de MercadoLibre para este producto."}
+
+    print(f"[PUBLISH] Category: {category_id}", flush=True)
+
+    # 2. Build attributes — always include BRAND and MODEL, plus any other required
+    required_ids = await _get_required_attribute_ids(category_id)
+    attributes = [
+        {"id": "BRAND", "value_name": brand},
+        {"id": "MODEL", "value_name": model},
+    ]
+    # Add ITEM_CONDITION if required (separate from the top-level "condition")
+    if "ITEM_CONDITION" in required_ids:
+        condition_value = "Nuevo" if condition == "new" else "Usado"
+        attributes.append({"id": "ITEM_CONDITION", "value_name": condition_value})
+
+    # Find GTIN automatically
+    gtin = await _find_gtin(brand, model)
+    if gtin:
+        attributes.append({"id": "GTIN", "value_name": gtin})
+
+    print(f"[PUBLISH] Attributes: {attributes}", flush=True)
+
+    # 3. Upload image
+    pictures = []
+    if image_url and access_token:
+        picture_id = await _upload_image(access_token, image_url)
+        if picture_id:
+            pictures.append({"id": picture_id})
+            print(f"[PUBLISH] Image uploaded: {picture_id}", flush=True)
+        else:
+            print(f"[PUBLISH] Image upload failed, continuing without image", flush=True)
+
+    # 4. Create listing
+    payload = {
+        "title": title[:60],  # ML max 60 chars
         "category_id": category_id,
         "price": price,
-        "currency_id": currency_id,
-        "available_quantity": available_quantity,
-        "buying_mode": buying_mode,
+        "currency_id": "ARS",
+        "available_quantity": 1,
+        "buying_mode": "buy_it_now",
         "condition": condition,
-        "listing_type_id": "free",  # Force free listing (no photos required)
+        "listing_type_id": "gold_special",
+        "attributes": attributes,
     }
+    if pictures:
+        payload["pictures"] = pictures
 
-    # Ensure attributes list exists and add GTIN if missing (required by many categories)
-    attrs = list(attributes) if attributes else []
-    attr_ids = {a.get("id") for a in attrs}
-    if "GTIN" not in attr_ids:
-        attrs.append({"id": "GTIN", "value_name": "Does not apply"})
-    if "ITEM_CONDITION" not in attr_ids:
-        attrs.append({"id": "ITEM_CONDITION", "value_name": "Usado" if condition == "used" else "Nuevo"})
-    item_payload["attributes"] = attrs
-
-    if picture_url:
-        item_payload["pictures"] = [{"source": picture_url}]
+    headers = {"Authorization": f"Bearer {access_token}"}
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # Create item
-        response = await client.post(
+        resp = await client.post(
             f"{ML_BASE_URL}/items",
+            json=payload,
             headers=headers,
-            json=item_payload,
         )
 
-    if response.is_error:
-        error_detail = response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text
-        return {"error": f"Error creando item: {response.status_code}", "detail": str(error_detail)[:500]}
+    if resp.is_error:
+        error_data = resp.json() if "application/json" in resp.headers.get("content-type", "") else resp.text
+        logger.error(f"ML create listing failed: {resp.status_code} - {error_data}")
 
-    item = response.json()
+        # Extract human-readable error causes
+        causes = []
+        if isinstance(error_data, dict):
+            for cause in error_data.get("cause", []):
+                if cause.get("type") == "error":
+                    causes.append(cause.get("message", ""))
+        cause_text = "; ".join(causes) if causes else str(error_data)
+        return {"error": f"Error al crear la publicación ({resp.status_code}): {cause_text}"}
+
+    item = resp.json()
     item_id = item.get("id")
-    permalink = item.get("permalink")
 
-    # Add description (separate endpoint)
+    # 5. Add description (separate ML API call)
     if description and item_id:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            desc_response = await client.post(
+            await client.post(
                 f"{ML_BASE_URL}/items/{item_id}/description",
-                headers=headers,
                 json={"plain_text": description},
+                headers=headers,
             )
-        if desc_response.is_error:
-            logger.warning(f"Error agregando descripcion a {item_id}: {desc_response.status_code}")
+
+    print(f"[PUBLISH] Success! {item.get('permalink')}", flush=True)
 
     return {
         "success": True,
         "item_id": item_id,
-        "permalink": permalink,
-        "status": item.get("status"),
         "title": item.get("title"),
+        "price": item.get("price"),
+        "permalink": item.get("permalink"),
+        "status": item.get("status"),
     }
-
-
-# Mapa de funciones para resolver custom tool calls del agente
-# create_ml_listing NO se incluye aca porque necesita access_token del usuario
-TOOL_HANDLERS = {
-    "search_ml_category": search_ml_category,
-    "get_category_attributes": get_category_attributes,
-}

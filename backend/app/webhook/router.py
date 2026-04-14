@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import logging
+from collections import OrderedDict
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from sqlalchemy.orm import Session
@@ -24,6 +25,8 @@ from app.shared.kapso import KapsoClient, KapsoError
 from .dispatcher import dispatch_message
 from app.onboarding.service import OnboardingService
 from app.publication.service import PublicationService
+from app.shared.models.user import User
+from app.publication.models import AgentSession
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +34,9 @@ router = APIRouter(prefix="/api/v1/webhook", tags=["webhook"])
 
 settings = get_settings()
 
-# Deduplication: track recently processed idempotency keys
-_processed_keys: set[str] = set()
-_MAX_KEYS = 1000
+# Dedup: track recently processed idempotency keys to ignore Kapso retries
+_processed_keys: OrderedDict[str, bool] = OrderedDict()
+_MAX_PROCESSED_KEYS = 200
 
 
 def _get_kapso_client() -> KapsoClient:
@@ -82,28 +85,34 @@ def _extract_message(data: dict) -> dict | None:
         return None
 
 
-async def _process_message_and_reply(phone: str, text: str, image_url: str | None, user_id=None, module: str = "onboarding"):
-    """Process message in background and send reply via Kapso."""
+def _send_reply(phone: str, text: str):
+    """Send a WhatsApp reply via Kapso."""
+    if not text or not settings.KAPSO_API_KEY or not settings.KAPSO_PHONE_NUMBER_ID:
+        return
+    try:
+        kapso = _get_kapso_client()
+        kapso.send_text(to=phone, body=text)
+        print(f"[WEBHOOK] Sent to {phone}", flush=True)
+    except KapsoError as e:
+        print(f"[WEBHOOK] Kapso send error: {e}", flush=True)
+
+
+async def _process_publication_background(user_id, phone: str, text: str, image_url: str | None):
+    """Process publication agent in background with its own DB session."""
+    # Send immediate feedback for images so the user knows we're working
+    if image_url:
+        _send_reply(phone, "📸 Recibí tu foto, la estoy analizando...")
+
     db = SessionLocal()
     try:
-        if module == "onboarding" or module == "needs_ml":
-            service = OnboardingService(db)
-            response = await service.process_step(phone, text)
-        else:
-            service = PublicationService(db)
-            response = await service.process_message(user_id, text, image_url=image_url)
-
+        service = PublicationService(db)
+        response = await service.process_message(user_id, text, image_url=image_url)
         response_text = response.get("response", "")
-        print(f"[WEBHOOK] Response to send: {response_text[:200]!r}", flush=True)
-        if response_text and settings.KAPSO_API_KEY and settings.KAPSO_PHONE_NUMBER_ID:
-            try:
-                kapso = _get_kapso_client()
-                kapso.send_text(to=phone, body=response_text)
-                print(f"[WEBHOOK] Sent to {phone}", flush=True)
-            except KapsoError as e:
-                print(f"[WEBHOOK] Kapso send error: {e}", flush=True)
+        print(f"[WEBHOOK] Agent response: {response_text[:200]!r}", flush=True)
+        _send_reply(phone, response_text)
     except Exception as e:
-        print(f"[WEBHOOK] Background error: {e}", flush=True)
+        print(f"[WEBHOOK] Background publication error: {e}", flush=True)
+        _send_reply(phone, "Hubo un error procesando tu mensaje. Intentá de nuevo.")
     finally:
         db.close()
 
@@ -131,14 +140,14 @@ async def receive_webhook(
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Body no es JSON valido")
 
-    # Deduplication via idempotency key
+    # Dedup: ignore Kapso retries for the same event
     if x_idempotency_key:
         if x_idempotency_key in _processed_keys:
-            print(f"[WEBHOOK] Duplicado ignorado: {x_idempotency_key}", flush=True)
+            print(f"[WEBHOOK] Dedup: ignoring retry {x_idempotency_key}", flush=True)
             return {"status": "ok"}
-        _processed_keys.add(x_idempotency_key)
-        if len(_processed_keys) > _MAX_KEYS:
-            _processed_keys.clear()
+        _processed_keys[x_idempotency_key] = True
+        if len(_processed_keys) > _MAX_PROCESSED_KEYS:
+            _processed_keys.popitem(last=False)
 
     # Soporte batch
     events = body if (x_webhook_batch and isinstance(body, list)) else [body]
@@ -160,19 +169,36 @@ async def receive_webhook(
         image_url = extracted["image_url"]
         print(f"[WEBHOOK] Mensaje de {phone}: {text!r} image={image_url}", flush=True)
 
-        # Determine module
+        # Reset command — reset onboarding + agent sessions
         if text.strip().lower() in {"reiniciar", "reset", "/reiniciar", "/reset"}:
-            module = "onboarding"
-            user_id = None
+            service = OnboardingService(db)
+            response = await service.process_step(phone, text)
+            # Also clear agent sessions so publication starts fresh
+            user = db.query(User).filter(User.phone == phone).first()
+            if user:
+                db.query(AgentSession).filter(
+                    AgentSession.user_id == user.id,
+                    AgentSession.completed == False,
+                ).update({"completed": True})
+                db.commit()
+            _send_reply(phone, response.get("response", ""))
         else:
+            # Dispatcher decide: onboarding o publication
             result = await dispatch_message(phone, text, db)
-            module = result["module"]
-            user_id = result["user"].id if result.get("user") else None
 
-        # Process in background so we return 200 to Kapso immediately
-        asyncio.create_task(
-            _process_message_and_reply(phone, text, image_url, user_id, module)
-        )
+            if result["module"] == "onboarding":
+                # Onboarding is fast (single Haiku call) — process inline
+                service = OnboardingService(db)
+                response = await service.process_step(phone, text)
+                _send_reply(phone, response.get("response", ""))
+            else:
+                # Publication agent is slow — process in background
+                # Return 200 OK to Kapso immediately, send reply when agent finishes
+                asyncio.create_task(
+                    _process_publication_background(
+                        result["user"].id, phone, text, image_url
+                    )
+                )
 
-    # Return 200 immediately — Kapso requires response in <10 seconds
+    # Return 200 OK immediately — Kapso requires this within 10 seconds
     return {"status": "ok"}

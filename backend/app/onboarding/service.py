@@ -51,11 +51,11 @@ MESSAGES = {
     ),
     "already_connected": (
         "¡Ya tenés tu cuenta de MercadoLibre conectada! 🎉\n"
-        "Escribí *publicar* para crear una publicación."
+        "Mandame una foto de lo que querés vender o contame qué producto querés publicar."
     ),
     "oauth_success": (
         "✅ ¡Tu cuenta de MercadoLibre fue conectada con éxito!\n"
-        "Ya podés empezar a publicar. Escribí *publicar* para arrancar."
+        "Ya podés empezar a publicar. Mandame una foto del producto o contame qué querés vender. 📸"
     ),
     "unclear": (
         "No estoy seguro de haber entendido. 🤔\n"

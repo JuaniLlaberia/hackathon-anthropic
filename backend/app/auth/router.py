@@ -150,7 +150,7 @@ async def ml_oauth_callback(
                 to=phone,
                 body=(
                     "✅ ¡Tu cuenta de MercadoLibre fue conectada con éxito!\n"
-                    "Ya podés empezar a publicar. Escribí *publicar* para arrancar."
+                    "Ya podés empezar a publicar. Mandame una foto del producto o contame qué querés vender. 📸"
                 ),
             )
         except KapsoError as e:

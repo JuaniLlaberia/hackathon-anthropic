@@ -7,7 +7,11 @@
       "Bash(python -m json.tool)",
       "Bash(python:*)",
       "Bash(xargs grep:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(python3 -m json.tool)",
+      "WebFetch(domain:developers.mercadolibre.com.ar)",
+      "WebFetch(domain:api.mercadolibre.com)",
+      "WebFetch(domain:developers.mercadolibre.com)"
     ]
   }
 }
