@@ -6,11 +6,6 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "postgresql://hackathon:hackathon@localhost:5432/hackathon"
 
-    # JWT
-    JWT_SECRET: str = "CAMBIAR-POR-UN-SECRETO-SEGURO"
-    JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRATION_MINUTES: int = 1440
-
     # Kapso
     KAPSO_WEBHOOK_SECRET: str = ""
     KAPSO_API_URL: str = "https://api.kapso.io/v1"
