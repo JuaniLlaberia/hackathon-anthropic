@@ -29,12 +29,15 @@ class PublicationService:
             .first()
         )
 
+        # Use stored image_url from previous messages if current message has none
+        effective_image_url = image_url or (agent_session.image_url if agent_session else None)
+
         agent = AgentService(self.db)
         result = await agent.process_message(
             user_id=user_id,
             session_id=agent_session.session_id if agent_session else None,
             message=message,
-            image_url=image_url,
+            image_url=effective_image_url,
         )
 
         # Persist session if new
@@ -44,6 +47,10 @@ class PublicationService:
                 session_id=result["session_id"],
             )
             self.db.add(agent_session)
+
+        # Save image_url if this message had one
+        if image_url:
+            agent_session.image_url = image_url
 
         if result.get("completed"):
             agent_session.completed = True

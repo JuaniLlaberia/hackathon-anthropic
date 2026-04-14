@@ -80,47 +80,92 @@ async def get_category_attributes(category_id: str) -> dict:
     return {"required_attributes": required, "optional_attributes": optional[:10]}
 
 
-async def search_similar_products(query: str, limit: int = 5) -> dict:
+async def create_ml_listing(
+    access_token: str,
+    title: str,
+    category_id: str,
+    price: float,
+    condition: str,
+    description: str,
+    currency_id: str = "ARS",
+    available_quantity: int = 1,
+    buying_mode: str = "buy_it_now",
+    listing_type_id: str = "free",
+    attributes: list | None = None,
+    picture_url: str | None = None,
+) -> dict:
     """
-    Busca productos similares en ML para referencia de precios.
+    Crea una publicacion en Mercado Libre.
+    Primero crea el item, luego agrega la descripcion (endpoint separado).
     """
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"{ML_BASE_URL}/sites/{ML_SITE}/search",
-            params={"q": query, "limit": limit},
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    # Build item payload
+    item_payload = {
+        "title": title[:60],
+        "category_id": category_id,
+        "price": price,
+        "currency_id": currency_id,
+        "available_quantity": available_quantity,
+        "buying_mode": buying_mode,
+        "condition": condition,
+        "listing_type_id": "free",  # Force free listing (no photos required)
+    }
+
+    # Ensure attributes list exists and add GTIN if missing (required by many categories)
+    attrs = list(attributes) if attributes else []
+    attr_ids = {a.get("id") for a in attrs}
+    if "GTIN" not in attr_ids:
+        attrs.append({"id": "GTIN", "value_name": "Does not apply"})
+    if "ITEM_CONDITION" not in attr_ids:
+        attrs.append({"id": "ITEM_CONDITION", "value_name": "Usado" if condition == "used" else "Nuevo"})
+    item_payload["attributes"] = attrs
+
+    if picture_url:
+        item_payload["pictures"] = [{"source": picture_url}]
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # Create item
+        response = await client.post(
+            f"{ML_BASE_URL}/items",
+            headers=headers,
+            json=item_payload,
         )
+
     if response.is_error:
-        return {"error": f"ML API error: {response.status_code}"}
+        error_detail = response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text
+        return {"error": f"Error creando item: {response.status_code}", "detail": str(error_detail)[:500]}
 
-    data = response.json()
-    results = data.get("results", [])
+    item = response.json()
+    item_id = item.get("id")
+    permalink = item.get("permalink")
 
-    products = []
-    for item in results:
-        products.append({
-            "title": item.get("title"),
-            "price": item.get("price"),
-            "currency": item.get("currency_id"),
-            "condition": item.get("condition"),
-            "sold_quantity": item.get("sold_quantity", 0),
-            "permalink": item.get("permalink"),
-        })
+    # Add description (separate endpoint)
+    if description and item_id:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            desc_response = await client.post(
+                f"{ML_BASE_URL}/items/{item_id}/description",
+                headers=headers,
+                json={"plain_text": description},
+            )
+        if desc_response.is_error:
+            logger.warning(f"Error agregando descripcion a {item_id}: {desc_response.status_code}")
 
-    prices = [p["price"] for p in products if p["price"]]
-    price_summary = {}
-    if prices:
-        price_summary = {
-            "min": min(prices),
-            "max": max(prices),
-            "avg": round(sum(prices) / len(prices)),
-        }
-
-    return {"products": products, "price_summary": price_summary}
+    return {
+        "success": True,
+        "item_id": item_id,
+        "permalink": permalink,
+        "status": item.get("status"),
+        "title": item.get("title"),
+    }
 
 
 # Mapa de funciones para resolver custom tool calls del agente
+# create_ml_listing NO se incluye aca porque necesita access_token del usuario
 TOOL_HANDLERS = {
     "search_ml_category": search_ml_category,
     "get_category_attributes": get_category_attributes,
-    "search_similar_products": search_similar_products,
 }

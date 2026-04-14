@@ -8,15 +8,17 @@ Kapso envia un POST con:
 - X-Webhook-Batch: presente si hay multiples eventos agrupados
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.database import SessionLocal
 from app.shared.deps import get_db
 from app.shared.kapso import KapsoClient, KapsoError
 from .dispatcher import dispatch_message
@@ -28,6 +30,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/webhook", tags=["webhook"])
 
 settings = get_settings()
+
+# Deduplication: track recently processed idempotency keys
+_processed_keys: set[str] = set()
+_MAX_KEYS = 1000
 
 
 def _get_kapso_client() -> KapsoClient:
@@ -76,6 +82,32 @@ def _extract_message(data: dict) -> dict | None:
         return None
 
 
+async def _process_message_and_reply(phone: str, text: str, image_url: str | None, user_id=None, module: str = "onboarding"):
+    """Process message in background and send reply via Kapso."""
+    db = SessionLocal()
+    try:
+        if module == "onboarding" or module == "needs_ml":
+            service = OnboardingService(db)
+            response = await service.process_step(phone, text)
+        else:
+            service = PublicationService(db)
+            response = await service.process_message(user_id, text, image_url=image_url)
+
+        response_text = response.get("response", "")
+        print(f"[WEBHOOK] Response to send: {response_text[:200]!r}", flush=True)
+        if response_text and settings.KAPSO_API_KEY and settings.KAPSO_PHONE_NUMBER_ID:
+            try:
+                kapso = _get_kapso_client()
+                kapso.send_text(to=phone, body=response_text)
+                print(f"[WEBHOOK] Sent to {phone}", flush=True)
+            except KapsoError as e:
+                print(f"[WEBHOOK] Kapso send error: {e}", flush=True)
+    except Exception as e:
+        print(f"[WEBHOOK] Background error: {e}", flush=True)
+    finally:
+        db.close()
+
+
 @router.post("")
 @router.post("/")
 async def receive_webhook(
@@ -99,6 +131,15 @@ async def receive_webhook(
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Body no es JSON valido")
 
+    # Deduplication via idempotency key
+    if x_idempotency_key:
+        if x_idempotency_key in _processed_keys:
+            print(f"[WEBHOOK] Duplicado ignorado: {x_idempotency_key}", flush=True)
+            return {"status": "ok"}
+        _processed_keys.add(x_idempotency_key)
+        if len(_processed_keys) > _MAX_KEYS:
+            _processed_keys.clear()
+
     # Soporte batch
     events = body if (x_webhook_batch and isinstance(body, list)) else [body]
 
@@ -119,24 +160,19 @@ async def receive_webhook(
         image_url = extracted["image_url"]
         print(f"[WEBHOOK] Mensaje de {phone}: {text!r} image={image_url}", flush=True)
 
-        # Reset command — always handled by onboarding, regardless of user state
+        # Determine module
         if text.strip().lower() in {"reiniciar", "reset", "/reiniciar", "/reset"}:
-            service = OnboardingService(db)
-            response = await service.process_step(phone, text)
+            module = "onboarding"
+            user_id = None
         else:
-            service = PublicationService(db)
-            response = await service.process_message(result["user"].id, text, image_url=image_url)
+            result = await dispatch_message(phone, text, db)
+            module = result["module"]
+            user_id = result["user"].id if result.get("user") else None
 
-        # Enviar respuesta al usuario via WhatsApp
-        response_text = response.get("response", "")
-        print(f"[WEBHOOK] Response to send: {response_text[:200]!r}", flush=True)
-        if response_text and settings.KAPSO_API_KEY and settings.KAPSO_PHONE_NUMBER_ID:
-            try:
-                kapso = _get_kapso_client()
-                kapso.send_text(to=phone, body=response_text)
-                print(f"[WEBHOOK] Sent to {phone}", flush=True)
-            except KapsoError as e:
-                print(f"[WEBHOOK] Kapso send error: {e}", flush=True)
+        # Process in background so we return 200 to Kapso immediately
+        asyncio.create_task(
+            _process_message_and_reply(phone, text, image_url, user_id, module)
+        )
 
-    # Kapso requiere 200 OK en menos de 10 segundos
+    # Return 200 immediately — Kapso requires response in <10 seconds
     return {"status": "ok"}
