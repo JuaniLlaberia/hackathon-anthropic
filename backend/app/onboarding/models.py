@@ -24,7 +24,8 @@ class OnboardingSession(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
-    current_step = Column(Integer, default=0)
+    current_step = Column(Integer, default=0)  # kept for migration compat
+    state = Column(String(30), default="welcome")  # welcome | account_check | oauth_pending | registration_pending | completed
     data = Column(JSON, default=dict)
     completed = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)

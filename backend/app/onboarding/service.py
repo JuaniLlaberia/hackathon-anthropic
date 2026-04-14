@@ -1,14 +1,57 @@
+import logging
+
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.shared.models.user import User
-from .models import Profile, OnboardingSession
+from app.shared.claude_client import ClaudeClient
+from app.shared.ml_client import MercadoLibreClient
+from .models import OnboardingSession
 
-ONBOARDING_STEPS = [
-    {"step": 0, "field": "name", "prompt": "Hola! Bienvenido. Como te llamas?"},
-    {"step": 1, "field": "email", "prompt": "Genial, {name}. Cual es tu email?"},
-    {"step": 2, "field": "city", "prompt": "De que ciudad sos?"},
-    {"step": 3, "field": "bio", "prompt": "Contanos un poco sobre vos (breve bio):"},
-]
+logger = logging.getLogger(__name__)
+
+settings = get_settings()
+
+ML_REGISTER_URL = "https://www.mercadolibre.com.ar/registration"
+
+MESSAGES = {
+    "welcome": (
+        "👋 ¡Hola! Soy tu asistente para publicar en MercadoLibre.\n\n"
+        "Para empezar necesito conectar tu cuenta de MercadoLibre.\n"
+        "¿Ya tenés una cuenta? Respondé *sí* o *no*."
+    ),
+    "oauth_link": (
+        "¡Perfecto! Hacé click en este link para autorizar el acceso a tu cuenta:\n\n"
+        "{oauth_url}\n\n"
+        "Cuando termines, te confirmo por acá. 🔗"
+    ),
+    "registration_guide": (
+        "¡No hay problema! Primero creá tu cuenta en MercadoLibre:\n\n"
+        f"{ML_REGISTER_URL}\n\n"
+        "Cuando la tengas lista, escribime de nuevo y te ayudo a conectarla. 👍"
+    ),
+    "registration_followup": (
+        "¡Hola de nuevo! ¿Ya creaste tu cuenta en MercadoLibre?\n"
+        "Si es así te mando el link para conectarla."
+    ),
+    "oauth_waiting": (
+        "Todavía estoy esperando que autorices tu cuenta.\n"
+        "Usá el link que te mandé. Si lo perdiste, acá va de nuevo:\n\n"
+        "{oauth_url}"
+    ),
+    "already_connected": (
+        "¡Ya tenés tu cuenta de MercadoLibre conectada! 🎉\n"
+        "Escribí *publicar* para crear una publicación."
+    ),
+    "oauth_success": (
+        "✅ ¡Tu cuenta de MercadoLibre fue conectada con éxito!\n"
+        "Ya podés empezar a publicar. Escribí *publicar* para arrancar."
+    ),
+    "unclear": (
+        "No entendí tu respuesta. ¿Tenés cuenta en MercadoLibre?\n"
+        "Respondé *sí* o *no*."
+    ),
+}
 
 
 class OnboardingService:
@@ -27,59 +70,158 @@ class OnboardingService:
     def _get_or_create_session(self, user_id) -> OnboardingSession:
         session = (
             self.db.query(OnboardingSession)
-            .filter(OnboardingSession.user_id == user_id, OnboardingSession.completed == False)
+            .filter(
+                OnboardingSession.user_id == user_id,
+                OnboardingSession.completed == False,
+            )
             .first()
         )
         if not session:
-            session = OnboardingSession(user_id=user_id, data={})
+            session = OnboardingSession(user_id=user_id, state="welcome", data={})
             self.db.add(session)
             self.db.commit()
             self.db.refresh(session)
         return session
 
+    def _get_ml_client(self) -> MercadoLibreClient:
+        redirect_uri = settings.ML_REDIRECT_URI or f"{settings.BACKEND_BASE_URL}/api/v1/auth/ml/callback"
+        return MercadoLibreClient(
+            app_id=settings.ML_APP_ID,
+            app_secret=settings.ML_APP_SECRET,
+            redirect_uri=redirect_uri,
+        )
+
+    def _get_claude_client(self) -> ClaudeClient:
+        return ClaudeClient(api_key=settings.ANTHROPIC_API_KEY)
+
     async def process_step(self, phone: str, message: str) -> dict:
+        """Main entry point — routes to the right handler based on session state."""
         user = self._get_or_create_user(phone)
+
+        # Already fully connected — skip onboarding
+        if user.ml_connected and user.is_onboarded:
+            return {"response": MESSAGES["already_connected"], "completed": True}
+
         session = self._get_or_create_session(user.id)
 
-        if session.current_step >= len(ONBOARDING_STEPS):
-            return {"response": "Ya completaste el registro.", "completed": True}
+        handler = {
+            "welcome": self._handle_welcome,
+            "account_check": self._handle_account_check,
+            "oauth_pending": self._handle_oauth_pending,
+            "registration_pending": self._handle_registration_pending,
+        }.get(session.state)
 
-        # Guardar respuesta del paso actual
-        step_config = ONBOARDING_STEPS[session.current_step]
-        data = dict(session.data) if session.data else {}
-        data[step_config["field"]] = message
-        session.data = data
+        if not handler:
+            return {"response": MESSAGES["already_connected"], "completed": True}
 
-        # Avanzar al siguiente paso
-        session.current_step += 1
+        return await handler(user, session, message)
+
+    async def _handle_welcome(self, user: User, session: OnboardingSession, message: str) -> dict:
+        """First contact — greet and ask if they have an ML account."""
+        session.state = "account_check"
         self.db.commit()
+        return {"response": MESSAGES["welcome"], "completed": False}
 
-        if session.current_step >= len(ONBOARDING_STEPS):
-            self._finalize_onboarding(user, session)
+    async def _handle_account_check(self, user: User, session: OnboardingSession, message: str) -> dict:
+        """User should answer yes/no about having an ML account."""
+        claude = self._get_claude_client()
+        answer = claude.interpret_yes_no(message)
+
+        if answer is True:
+            # Has account — send OAuth link
+            ml = self._get_ml_client()
+            oauth_url = ml.build_oauth_url(user.phone)
+            session.state = "oauth_pending"
+            data = dict(session.data) if session.data else {}
+            data["oauth_url"] = oauth_url
+            session.data = data
+            self.db.commit()
             return {
-                "response": "Registro completo! Ya podes publicar. Escribi 'publicar' para empezar.",
-                "completed": True,
+                "response": MESSAGES["oauth_link"].format(oauth_url=oauth_url),
+                "completed": False,
             }
 
-        # Enviar siguiente pregunta
-        next_step = ONBOARDING_STEPS[session.current_step]
-        prompt = next_step["prompt"].format(**data)
-        return {"response": prompt, "completed": False}
+        if answer is False:
+            # No account — guide to register
+            session.state = "registration_pending"
+            self.db.commit()
+            return {"response": MESSAGES["registration_guide"], "completed": False}
 
-    def _finalize_onboarding(self, user: User, session: OnboardingSession):
+        # Unclear — ask again
+        return {"response": MESSAGES["unclear"], "completed": False}
+
+    async def _handle_oauth_pending(self, user: User, session: OnboardingSession, message: str) -> dict:
+        """Waiting for OAuth callback. User might write something while waiting."""
         data = session.data or {}
-        user.name = data.get("name")
-        user.email = data.get("email")
+        oauth_url = data.get("oauth_url", "")
+
+        # If tokens arrived between messages (callback processed), we're done
+        if user.ml_connected:
+            session.state = "completed"
+            session.completed = True
+            self.db.commit()
+            return {"response": MESSAGES["oauth_success"], "completed": True}
+
+        # Still waiting — remind them
+        if not oauth_url:
+            ml = self._get_ml_client()
+            oauth_url = ml.build_oauth_url(user.phone)
+        return {
+            "response": MESSAGES["oauth_waiting"].format(oauth_url=oauth_url),
+            "completed": False,
+        }
+
+    async def _handle_registration_pending(self, user: User, session: OnboardingSession, message: str) -> dict:
+        """User was told to create ML account. They're messaging back."""
+        claude = self._get_claude_client()
+        answer = claude.interpret_yes_no(message)
+
+        if answer is True:
+            # They created the account — send OAuth link
+            ml = self._get_ml_client()
+            oauth_url = ml.build_oauth_url(user.phone)
+            session.state = "oauth_pending"
+            data = dict(session.data) if session.data else {}
+            data["oauth_url"] = oauth_url
+            session.data = data
+            self.db.commit()
+            return {
+                "response": MESSAGES["oauth_link"].format(oauth_url=oauth_url),
+                "completed": False,
+            }
+
+        # Any other response — ask again
+        return {"response": MESSAGES["registration_followup"], "completed": False}
+
+    def complete_oauth(
+        self,
+        user: User,
+        access_token: str,
+        refresh_token: str,
+        expires_at,
+        ml_user_id: str,
+    ):
+        """Called from the OAuth callback endpoint — not from WhatsApp flow."""
+        user.ml_access_token = access_token
+        user.ml_refresh_token = refresh_token
+        user.ml_token_expires_at = expires_at
+        user.ml_user_id = ml_user_id
+        user.ml_connected = True
         user.is_onboarded = True
 
-        profile = Profile(
-            user_id=user.id,
-            city=data.get("city"),
-            bio=data.get("bio"),
+        # Close any active onboarding session
+        active_session = (
+            self.db.query(OnboardingSession)
+            .filter(
+                OnboardingSession.user_id == user.id,
+                OnboardingSession.completed == False,
+            )
+            .first()
         )
-        self.db.add(profile)
+        if active_session:
+            active_session.state = "completed"
+            active_session.completed = True
 
-        session.completed = True
         self.db.commit()
 
     def get_status(self, phone: str) -> dict:
@@ -87,9 +229,9 @@ class OnboardingService:
         if not user:
             return {
                 "phone": phone,
-                "current_step": 0,
-                "total_steps": len(ONBOARDING_STEPS),
+                "state": "not_started",
                 "completed": False,
+                "ml_connected": False,
                 "data": {},
             }
 
@@ -100,19 +242,10 @@ class OnboardingService:
             .first()
         )
 
-        if not session:
-            return {
-                "phone": phone,
-                "current_step": 0,
-                "total_steps": len(ONBOARDING_STEPS),
-                "completed": False,
-                "data": {},
-            }
-
         return {
             "phone": phone,
-            "current_step": session.current_step,
-            "total_steps": len(ONBOARDING_STEPS),
-            "completed": session.completed,
-            "data": session.data or {},
+            "state": session.state if session else "not_started",
+            "completed": session.completed if session else False,
+            "ml_connected": user.ml_connected,
+            "data": session.data if session else {},
         }

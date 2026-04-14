@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.webhook.router import router as webhook_router
 from app.onboarding.router import router as onboarding_router
 from app.publication.router import router as publication_router
+from app.auth.router import router as auth_router
 
 app = FastAPI(title="Hackathon Bot API", version="0.1.0")
 
@@ -18,6 +19,7 @@ app.add_middleware(
 app.include_router(webhook_router)
 app.include_router(onboarding_router)
 app.include_router(publication_router)
+app.include_router(auth_router)
 
 
 @app.get("/health")
