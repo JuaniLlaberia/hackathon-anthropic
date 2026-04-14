@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "Bash(docker compose:*)",
+      "Bash(curl:*)",
+      "Bash(python -m json.tool)"
+    ]
+  }
+}
