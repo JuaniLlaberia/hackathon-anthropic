@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     KAPSO_API_KEY: str = ""
     KAPSO_PHONE_NUMBER_ID: str = ""
 
+    # MercadoLibre OAuth
+    ML_APP_ID: str = ""
+    ML_APP_SECRET: str = ""
+    ML_REDIRECT_URI: str = ""  # e.g. https://<ngrok>/api/v1/auth/ml/callback
+    BACKEND_BASE_URL: str = "http://localhost:8000"
+
     # Anthropic
     ANTHROPIC_API_KEY: str = ""
 

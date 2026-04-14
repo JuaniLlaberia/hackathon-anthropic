@@ -77,6 +77,7 @@ def _extract_message(data: dict) -> dict | None:
 
 
 @router.post("")
+@router.post("/")
 async def receive_webhook(
     request: Request,
     db: Session = Depends(get_db),
@@ -118,10 +119,8 @@ async def receive_webhook(
         image_url = extracted["image_url"]
         print(f"[WEBHOOK] Mensaje de {phone}: {text!r} image={image_url}", flush=True)
 
-        # Dispatcher decide: onboarding o publication
-        result = await dispatch_message(phone, text, db)
-
-        if result["module"] == "onboarding":
+        # Reset command — always handled by onboarding, regardless of user state
+        if text.strip().lower() in {"reiniciar", "reset", "/reiniciar", "/reset"}:
             service = OnboardingService(db)
             response = await service.process_step(phone, text)
         else:

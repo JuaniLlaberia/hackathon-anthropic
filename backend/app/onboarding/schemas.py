@@ -4,6 +4,10 @@ from uuid import UUID
 from pydantic import BaseModel
 
 
+class OnboardingStartRequest(BaseModel):
+    phone: str
+
+
 class OnboardingStepRequest(BaseModel):
     phone: str
     message: str
@@ -11,9 +15,9 @@ class OnboardingStepRequest(BaseModel):
 
 class OnboardingStatusResponse(BaseModel):
     phone: str
-    current_step: int
-    total_steps: int
+    state: str
     completed: bool
+    ml_connected: bool
     data: dict
 
     model_config = {"from_attributes": True}

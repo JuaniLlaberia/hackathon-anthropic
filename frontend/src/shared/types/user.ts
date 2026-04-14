@@ -5,6 +5,7 @@ export interface User {
   email: string | null;
   is_verified: boolean;
   is_onboarded: boolean;
+  ml_connected: boolean;
   role: string;
   created_at: string;
 }

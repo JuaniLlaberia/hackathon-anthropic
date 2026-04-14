@@ -5,9 +5,17 @@ from app.shared.deps import get_db
 from app.shared.schemas.user import UserResponse
 from app.shared.models.user import User
 from .service import OnboardingService
-from .schemas import OnboardingStepRequest, OnboardingStatusResponse
+from .schemas import OnboardingStartRequest, OnboardingStepRequest, OnboardingStatusResponse
 
 router = APIRouter(prefix="/api/v1/onboarding", tags=["onboarding"])
+
+
+@router.post("/start")
+async def start_onboarding(request: OnboardingStartRequest, db: Session = Depends(get_db)):
+    """Manually start onboarding for a phone number. Returns the first prompt."""
+    service = OnboardingService(db)
+    result = await service.process_step(request.phone, "")
+    return result
 
 
 @router.post("/step")

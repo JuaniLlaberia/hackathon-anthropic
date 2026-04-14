@@ -19,6 +19,7 @@ class UserResponse(UserBase):
     id: UUID
     is_verified: bool
     is_onboarded: bool
+    ml_connected: bool = False
     role: str
     created_at: datetime
 

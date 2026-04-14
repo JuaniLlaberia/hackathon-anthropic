@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import apiClient from "../../shared/api/client";
 import type { User } from "../../shared/types/user";
+import OnboardingStats from "../components/OnboardingStats";
 
 export default function AdminDashboard() {
   const [users, setUsers] = useState<User[]>([]);
@@ -18,24 +19,17 @@ export default function AdminDashboard() {
 
   const onboarded = users.filter((u) => u.is_onboarded).length;
   const pending = users.filter((u) => !u.is_onboarded).length;
+  const mlConnected = users.filter((u) => u.ml_connected).length;
 
   return (
     <div>
-      <h1>Admin Dashboard</h1>
-      <div style={{ display: "flex", gap: "2rem", marginBottom: "2rem" }}>
-        <div style={{ padding: "1rem", border: "1px solid #ccc", borderRadius: "8px" }}>
-          <h3>Total usuarios</h3>
-          <p style={{ fontSize: "2rem" }}>{users.length}</p>
-        </div>
-        <div style={{ padding: "1rem", border: "1px solid #ccc", borderRadius: "8px" }}>
-          <h3>Onboarded</h3>
-          <p style={{ fontSize: "2rem" }}>{onboarded}</p>
-        </div>
-        <div style={{ padding: "1rem", border: "1px solid #ccc", borderRadius: "8px" }}>
-          <h3>Pendientes</h3>
-          <p style={{ fontSize: "2rem" }}>{pending}</p>
-        </div>
-      </div>
+      <h1 style={{ marginBottom: "1.5rem" }}>Admin Dashboard</h1>
+      <OnboardingStats
+        total={users.length}
+        onboarded={onboarded}
+        pending={pending}
+        mlConnected={mlConnected}
+      />
     </div>
   );
 }
