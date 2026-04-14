@@ -71,6 +71,7 @@ def _extract_phone_and_text(data: dict) -> tuple[str, str] | None:
 
 
 @router.post("")
+@router.post("/")
 async def receive_webhook(
     request: Request,
     db: Session = Depends(get_db),
@@ -109,15 +110,20 @@ async def receive_webhook(
         phone, text = extracted
         logger.info(f"Mensaje de {phone}: {text!r}")
 
-        # Dispatcher decide: onboarding o publication
-        result = await dispatch_message(phone, text, db)
-
-        if result["module"] == "onboarding":
+        # Reset command — always handled by onboarding, regardless of user state
+        if text.strip().lower() in {"reiniciar", "reset", "/reiniciar", "/reset"}:
             service = OnboardingService(db)
             response = await service.process_step(phone, text)
         else:
-            service = PublicationService(db)
-            response = await service.process_message(result["user"].id, text)
+            # Dispatcher decide: onboarding o publication
+            result = await dispatch_message(phone, text, db)
+
+            if result["module"] == "onboarding":
+                service = OnboardingService(db)
+                response = await service.process_step(phone, text)
+            else:
+                service = PublicationService(db)
+                response = await service.process_message(result["user"].id, text)
 
         # Enviar respuesta al usuario via WhatsApp
         response_text = response.get("response", "")

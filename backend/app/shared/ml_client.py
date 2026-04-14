@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import logging
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 import httpx
 
@@ -37,7 +38,7 @@ class MercadoLibreClient:
             f"{ML_AUTH_URL}"
             f"?response_type=code"
             f"&client_id={self.app_id}"
-            f"&redirect_uri={self.redirect_uri}"
+            f"&redirect_uri={quote(self.redirect_uri, safe='')}"
             f"&state={state}"
         )
 
@@ -66,12 +67,13 @@ class MercadoLibreClient:
             raise MercadoLibreError(response.status_code, response.text)
 
         data = response.json()
+        logger.info(f"ML token exchange response keys: {list(data.keys())}")
         return {
             "access_token": data["access_token"],
-            "refresh_token": data["refresh_token"],
-            "expires_in": data["expires_in"],
+            "refresh_token": data.get("refresh_token", ""),
+            "expires_in": data.get("expires_in", 21600),
             "user_id": str(data["user_id"]),
-            "expires_at": datetime.utcnow() + timedelta(seconds=data["expires_in"]),
+            "expires_at": datetime.utcnow() + timedelta(seconds=data.get("expires_in", 21600)),
         }
 
     def refresh_access_token(self, refresh_token: str) -> dict:

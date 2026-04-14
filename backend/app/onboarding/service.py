@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -13,6 +14,9 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 ML_REGISTER_URL = "https://www.mercadolibre.com.ar/registration"
+
+RESET_COMMANDS = {"reiniciar", "reset", "/reiniciar", "/reset"}
+SESSION_TTL_MINUTES = 30
 
 MESSAGES = {
     "welcome": (
@@ -51,6 +55,12 @@ MESSAGES = {
         "No entendí tu respuesta. ¿Tenés cuenta en MercadoLibre?\n"
         "Respondé *sí* o *no*."
     ),
+    "reset": (
+        "🔄 Listo, reinicié el proceso.\n\n"
+        "👋 Soy tu asistente para publicar en MercadoLibre.\n"
+        "Para empezar necesito conectar tu cuenta.\n"
+        "¿Ya tenés una cuenta? Respondé *sí* o *no*."
+    ),
 }
 
 
@@ -76,12 +86,41 @@ class OnboardingService:
             )
             .first()
         )
+
+        # Auto-expire stale sessions
+        if session and session.created_at:
+            age = datetime.utcnow() - session.created_at
+            if age > timedelta(minutes=SESSION_TTL_MINUTES):
+                logger.info(f"Session expired for user {user_id} (age: {age})")
+                session.completed = True
+                self.db.commit()
+                session = None
+
         if not session:
             session = OnboardingSession(user_id=user_id, state="welcome", data={})
             self.db.add(session)
             self.db.commit()
             self.db.refresh(session)
         return session
+
+    def _reset_session(self, user_id) -> OnboardingSession:
+        """Close any active session and create a fresh one."""
+        active = (
+            self.db.query(OnboardingSession)
+            .filter(
+                OnboardingSession.user_id == user_id,
+                OnboardingSession.completed == False,
+            )
+            .all()
+        )
+        for s in active:
+            s.completed = True
+
+        new_session = OnboardingSession(user_id=user_id, state="account_check", data={})
+        self.db.add(new_session)
+        self.db.commit()
+        self.db.refresh(new_session)
+        return new_session
 
     def _get_ml_client(self) -> MercadoLibreClient:
         redirect_uri = settings.ML_REDIRECT_URI or f"{settings.BACKEND_BASE_URL}/api/v1/auth/ml/callback"
@@ -97,6 +136,14 @@ class OnboardingService:
     async def process_step(self, phone: str, message: str) -> dict:
         """Main entry point — routes to the right handler based on session state."""
         user = self._get_or_create_user(phone)
+
+        # Handle reset command — works even if already connected
+        if message.strip().lower() in RESET_COMMANDS:
+            user.ml_connected = False
+            user.is_onboarded = False
+            self.db.commit()
+            self._reset_session(user.id)
+            return {"response": MESSAGES["reset"], "completed": False}
 
         # Already fully connected — skip onboarding
         if user.ml_connected and user.is_onboarded:
