@@ -103,19 +103,20 @@ async def receive_webhook(
 
     for event_data in events:
         event_type = x_webhook_event or event_data.get("event")
-        logger.info(f"Evento: {event_type} | idempotency_key={x_idempotency_key}")
+        print(f"[WEBHOOK] Evento: {event_type}", flush=True)
 
         if event_type != "whatsapp.message.received":
             continue
 
         extracted = _extract_message(event_data)
         if not extracted:
+            print(f"[WEBHOOK] No se pudo extraer mensaje", flush=True)
             continue
 
         phone = extracted["phone"]
         text = extracted["text"]
         image_url = extracted["image_url"]
-        logger.info(f"Mensaje de {phone}: {text!r} image={image_url is not None}")
+        print(f"[WEBHOOK] Mensaje de {phone}: {text!r} image={image_url}", flush=True)
 
         # Dispatcher decide: onboarding o publication
         result = await dispatch_message(phone, text, db)
@@ -129,13 +130,14 @@ async def receive_webhook(
 
         # Enviar respuesta al usuario via WhatsApp
         response_text = response.get("response", "")
+        print(f"[WEBHOOK] Response to send: {response_text[:200]!r}", flush=True)
         if response_text and settings.KAPSO_API_KEY and settings.KAPSO_PHONE_NUMBER_ID:
             try:
                 kapso = _get_kapso_client()
                 kapso.send_text(to=phone, body=response_text)
-                logger.info(f"Respuesta enviada a {phone}")
+                print(f"[WEBHOOK] Sent to {phone}", flush=True)
             except KapsoError as e:
-                logger.error(f"Error enviando respuesta a {phone}: {e}")
+                print(f"[WEBHOOK] Kapso send error: {e}", flush=True)
 
     # Kapso requiere 200 OK en menos de 10 segundos
     return {"status": "ok"}

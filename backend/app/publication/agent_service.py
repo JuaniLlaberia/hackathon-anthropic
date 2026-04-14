@@ -198,33 +198,65 @@ class AgentService:
         if not content:
             content.append({"type": "text", "text": "(empty message)"})
 
-        # Send message and process response
+        # Send message and collect response
         response_text = ""
         completed = False
 
-        with self.client.beta.sessions.events.stream(session_id) as stream:
-            self.client.beta.sessions.events.send(
-                session_id,
-                events=[{"type": "user.message", "content": content}],
-            )
-
-            for event in stream:
-                if event.type == "agent.message":
-                    for block in event.content:
-                        if hasattr(block, "text"):
-                            response_text += block.text
-
-                elif event.type == "agent.custom_tool_use":
-                    await self._handle_custom_tool(
-                        session_id, event.id, event.name, event.input
+        try:
+            # Try sending message; if session is stuck waiting for tool results,
+            # interrupt first and retry with a new session
+            try:
+                self.client.beta.sessions.events.send(
+                    session_id,
+                    events=[{"type": "user.message", "content": content}],
+                )
+            except anthropic.BadRequestError as e:
+                if "waiting on responses to events" in str(e):
+                    print(f"[AGENT] Session stuck, creating new one", flush=True)
+                    session_id = self._create_session()
+                    self.client.beta.sessions.events.send(
+                        session_id,
+                        events=[{"type": "user.message", "content": content}],
                     )
+                else:
+                    raise
 
-                elif event.type == "session.status_idle":
-                    break
+            with self.client.beta.sessions.events.stream(session_id) as stream:
 
-                elif event.type == "session.status_terminated":
-                    logger.error(f"Session {session_id} terminated")
-                    break
+                for event in stream:
+                    print(f"[AGENT] Event: {event.type}", flush=True)
+
+                    if event.type == "agent.message":
+                        for block in event.content:
+                            if hasattr(block, "text"):
+                                response_text += block.text
+
+                    elif event.type == "agent.custom_tool_use":
+                        tool_use_id = event.id
+                        tool_name = event.name
+                        tool_input = event.input if hasattr(event, "input") else {}
+                        print(f"[AGENT] Tool call: {tool_name}({tool_input})", flush=True)
+                        await self._handle_custom_tool(
+                            session_id, tool_use_id, tool_name, tool_input
+                        )
+
+                    elif event.type == "session.status_idle":
+                        print(f"[AGENT] Session idle", flush=True)
+                        break
+
+                    elif event.type == "session.status_terminated":
+                        print(f"[AGENT] Session terminated", flush=True)
+                        completed = True
+                        break
+
+        except Exception as e:
+            print(f"[AGENT] Error: {e}", flush=True)
+            # If session is stuck, mark as completed so a new one is created next time
+            return {
+                "response": "Hubo un error procesando tu mensaje. Intenta de nuevo.",
+                "session_id": session_id,
+                "completed": True,
+            }
 
         return {
             "response": response_text.strip(),
@@ -246,8 +278,9 @@ class AgentService:
         else:
             try:
                 result = await handler(**tool_input)
+                print(f"[AGENT] Tool result for {tool_name}: {str(result)[:200]}", flush=True)
             except Exception as e:
-                logger.error(f"Error executing tool {tool_name}: {e}")
+                print(f"[AGENT] Tool error for {tool_name}: {e}", flush=True)
                 result = {"error": str(e)}
 
         self.client.beta.sessions.events.send(
@@ -255,8 +288,10 @@ class AgentService:
             events=[
                 {
                     "type": "user.custom_tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "custom_tool_use_id": tool_use_id,
+                    "content": [
+                        {"type": "text", "text": json.dumps(result, ensure_ascii=False)},
+                    ],
                 },
             ],
         )
