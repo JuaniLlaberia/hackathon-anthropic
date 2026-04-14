@@ -5,7 +5,9 @@
       "Bash(docker compose:*)",
       "Bash(curl:*)",
       "Bash(python -m json.tool)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(xargs grep:*)",
+      "Bash(find:*)"
     ]
   }
 }

@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     KAPSO_WEBHOOK_SECRET: str = ""
     KAPSO_API_URL: str = "https://api.kapso.io/v1"
     KAPSO_API_KEY: str = ""
+    KAPSO_PHONE_NUMBER_ID: str = ""
 
     # Cloudinary
     CLOUDINARY_CLOUD_NAME: str = ""
